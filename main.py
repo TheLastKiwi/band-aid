@@ -4,6 +4,8 @@ import time
 import uvicorn
 import googlemaps
 from fastapi import FastAPI, Depends, HTTPException, Request
+from jwt import DecodeError
+
 from database_models.db_connector import get_database
 from sqlalchemy.orm import Session
 
@@ -73,11 +75,9 @@ def generate_code():
 def get_current_user(token: str = Depends(JwtBearer())):
     try:
         decoded = decode_jwt(token)
-    except:
+    except DecodeError:
         return None
-    if decoded != {}:
-        return JwtUser(user_id=decoded['user_id'])
-    return None
+    return JwtUser(user_id=decoded['user_id'])
 
 
 def get_current_user_partially_protected(request: Request):
@@ -90,10 +90,11 @@ def get_current_user_partially_protected(request: Request):
 
     token = has_auth_header()
     if token:
-        decoded = decode_jwt(token)
-        if decoded == {}:
+        try:
+            decoded = decode_jwt(token)
+            return JwtUser(user_id=decoded['user_id'])
+        except DecodeError:
             raise HTTPException(status_code=401, detail="Invalid token")
-        return JwtUser(user_id=decoded['user_id'])
     else:
         return None
 
@@ -241,6 +242,11 @@ async def get_user(id: int, db: Session = Depends(get_database)):
         user = db.query(User).where(User.id == id).first()
     except exc.sa_exc.SQLAlchemyError as err:
         raise HTTPException(status_code=500, detail="Could not get user")
+    return sanitize_user(user)
+
+def sanitize_user(user:User):
+    delattr(user,"password_hash")
+    delattr(user,"email_verified")
     return user
 
 @app.delete("/user/")

@@ -4,6 +4,7 @@ import pytest
 
 from unittest.mock import patch
 from fastapi.testclient import TestClient
+from pytest_mock import mocker
 from sqlalchemy import create_engine
 from sqlalchemy.orm import exc
 from sqlalchemy.orm import sessionmaker
@@ -49,11 +50,17 @@ invalid_data = {
 
 
 def test_valid_register_user():
-    resp = client.post("/register", json=valid_data)
-    assert resp.status_code == 200
     db = next(override_get_db())
-    assert len(db.query(EmailVerification).all()) == 1
-    assert len(db.query(User).all()) == 4
+    #mocker.mock("")
+    assert len(db.query(EmailVerification).where(EmailVerification.user_id == valid_data['email']).all()) == 0
+    assert len(db.query(User).where(User.email == valid_data['email']).all()) == 0
+    db.close()
+    resp = client.post("/register", json=valid_data)
+    db = next(override_get_db())
+    assert resp.status_code == 200
+    user = db.query(User).where(User.email == valid_data['email']).first()
+    assert len(db.query(User).where(User.email == valid_data['email']).all()) == 1
+    assert len(db.query(EmailVerification).where(EmailVerification.user_id == user.id).all()) == 1
     # TODO assert returned jwt is valid for given user
 
 

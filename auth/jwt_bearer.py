@@ -1,5 +1,7 @@
 from fastapi import Request, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jwt import DecodeError
+
 from auth.jwt_handler import decode_jwt
 
 
@@ -17,8 +19,11 @@ class JwtBearer(HTTPBearer):
             raise HTTPException(status_code=400, detail="No credentials present")
 
     def _verify_jwt(self, token: str) -> bool:
-        payload = decode_jwt(token)
-        if payload and payload is not {}:
+        try:
+            payload = decode_jwt(token)
+        except DecodeError:
+            return False
+        if payload:
             return True
         return False
 

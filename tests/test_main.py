@@ -15,7 +15,7 @@ from websockets.exceptions import ConnectionClosed
 
 from auth.jwt_handler import sign_jwt, decode_jwt
 from database_models.models import User, EmailVerification, Base, Band, BandMember, BandInvite, DBMessage, \
-    LookingForMember, Notification, NotificationType
+    LookingForMember, NotificationPriority, DBNotification
 from main import get_database, app
 from security.password_security import hash_password
 
@@ -78,19 +78,20 @@ def populate_db():
     db.add_all([user1_band, user5_band, user4])
     db.flush()
     user4_band1_invite = BandInvite(band_id=user1_band.id, user_id=user4.id, code="ABCD1234")
+    user5_band1_invite = BandInvite(band_id=user1_band.id, user_id=user5.id, code="ABCD1236")
     user4_band5_invite = BandInvite(band_id=user5_band.id, user_id=user4.id, code="ABCD1235")
     ev = EmailVerification(user_id=user4.id, code="ABCD1234")
     bm = BandMember(band_id=user1_band.id, user_id=user1.id, admin=True)
     bm2 = BandMember(band_id=user1_band.id, user_id=user2.id, admin=False)
     bm5 = BandMember(band_id=user5_band.id, user_id=user5.id, admin=True)
-    user5_notification = Notification(recipient_user_id=user5.id, message="You have been invited to join a band!", type=NotificationType.normal, expiration=time.time() + 600)
-    user1_notification = Notification(recipient_user_id=user1.id, message="You have been invited to join a band!",
-                                      type=NotificationType.normal, expiration=time.time() + 600)
-    user1_notification_read = Notification(recipient_user_id=user1.id, message="You have been invited to join a band!",
-                                      type=NotificationType.normal, read=True, expiration=time.time() + 600)
+    user5_notification = DBNotification(recipient_user_id=user5.id, message="You have been invited to join a band!", priority=NotificationPriority.normal, expiration=time.time() + 600)
+    user1_notification = DBNotification(recipient_user_id=user1.id, message="You have been invited to join a band!",
+                                        priority=NotificationPriority.normal, expiration=time.time() + 600)
+    user1_notification_read = DBNotification(recipient_user_id=user1.id, message="You have been invited to join a band!",
+                                             priority=NotificationPriority.normal, read=True, expiration=time.time() + 600)
     band1_lfm = LookingForMember(band_id=user1_band.id, talent="Drums")
     band2_lfm = LookingForMember(band_id=user5_band.id, talent="Double Guitar")
-    db.add_all([bm, bm2, bm5, band1_lfm, ev,user4_band1_invite, user4_band5_invite,
+    db.add_all([bm, bm2, bm5, band1_lfm, ev,user4_band1_invite, user4_band5_invite, user5_band1_invite,
                 band2_lfm, user5_notification, user1_notification, user1_notification_read])
     db.commit()
 
@@ -106,10 +107,10 @@ def test_invalid_data_register_user():
 
 
 def test_bad_db_register_user():
+    valid_data["email"] = "newemail@gmail.com"
     with mock.patch.object(Session, "add", side_effect=exc.sa_exc.SQLAlchemyError) as mock_close:
-        valid_data["email"] = "newemail@gmail.com"
         resp = client.post("/register", json=valid_data)
-        assert resp.status_code == 500
+    assert resp.status_code == 500
 
 
 def create_user(f, l, e, p, loc, db):
@@ -355,17 +356,23 @@ def test_delete_band_success():
     before_band = db.query(Band).where(Band.id == band_id).all()
     before_bm = db.query(BandMember).filter(BandMember.band_id == band_id).all()
     before_lfm = db.query(LookingForMember).where(LookingForMember.band_id == band_id).all()
-    resp = client.delete("/delete_band?band_id={0}".format(band_id), headers=header)
+    before_bi = db.query(BandInvite).where(BandInvite.band_id == band_id).all()
+    with patch('main.notify_band_members') as mock_notify_band_admins:
+        resp = client.delete("/delete_band?band_id={0}".format(band_id), headers=header)
+        assert resp.status_code == 200
+        mock_notify_band_admins.assert_called_once()
     after_bm = db.query(BandMember).filter(BandMember.band_id == band_id).all()
     after_lfm = db.query(LookingForMember).where(LookingForMember.band_id == band_id).all()
     after_band = db.query(Band).where(Band.id == band_id).all()
+    after_bi = db.query(BandInvite).where(BandInvite.band_id == band_id).all()
+    assert len(before_bi) > 0
+    assert len(after_bi) == 0
     assert len(before_bm) > 0
     assert len(after_bm) == 0
     assert len(before_lfm) > 0
     assert len(after_lfm) == 0
     assert len(before_band) > 0
     assert len(after_band) == 0
-    assert resp.status_code == 200
 
 
 def test_delete_band_band_does_not_exist():
@@ -389,8 +396,10 @@ def test_verify_user_email_success():
 
 def test_accept_invite_success():
     header = create_auth_header(4)
-    resp = client.post("/accept_invite?code={0}".format("ABCD1234"), headers=header)
-    assert resp.status_code == 200
+    with patch('main.notify_band_admins') as mock_notify_band_admins:
+        resp = client.post("/accept_invite?code={0}".format("ABCD1234"), headers=header)
+        assert resp.status_code == 200
+        mock_notify_band_admins.assert_called_once()
 
 
 def test_accept_invite_invalid_code():
@@ -400,10 +409,14 @@ def test_accept_invite_invalid_code():
 
 
 def test_decline_invite_success():
-    header = create_auth_header(4)
-    resp = client.post("/decline_invite?code={0}".format("ABCD1235"), headers=header)
-    assert resp.status_code == 200
-
+    header = create_auth_header(5)
+    with patch('main.notify_band_admins') as mock_notify_band_admins:
+        resp = client.post("/decline_invite?code={0}".format("ABCD1236"), headers=header)
+        assert resp.status_code == 200
+        mock_notify_band_admins.assert_called_once()
+    db = next(override_get_db())
+    invite = db.query(BandInvite).filter(BandInvite.code == "ABCD1236").first()
+    assert invite is None
 
 def test_decline_invite_invalid_code():
     header = create_auth_header(4)
@@ -486,7 +499,7 @@ def test_read_notification_notif_does_not_exist():
 def test_read_notification_wrong_user():
     header = create_auth_header(1)
     resp = client.put("/read_notification/{0}".format(1), headers=header)
-    assert resp.status_code == 401
+    assert resp.status_code == 404
 
 
 def test_read_notification_already_read():

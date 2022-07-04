@@ -28,11 +28,14 @@ from database_models.models import (
     BandMember,
     BandInvite,
     EmailVerification,
-    Band, Notification, LookingForMember, LookingForBand, LocationCache, BandInviteByEmail, DBMessage
+    Band, DBNotification, LookingForMember, LookingForBand, LocationCache, BandInviteByEmail, DBMessage,
+    NotificationPriority
 )
 from auth.jwt_handler import sign_jwt, decode_jwt
 from auth.jwt_bearer import JwtBearer
 from sqlalchemy.orm import exc
+
+from notifications.notifications import Notification
 from security.password_security import hash_password, verify_password
 import random
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +57,8 @@ app.add_middleware(CORSMiddleware,
                    allow_methods=["*"],
                    allow_headers=["*"])
 
-THIRTY_DAYS_IN_SECONDS = 30 * 24 * 60 * 60
+ONE_DAY_IN_SECONDS = 60 * 60 * 24
+THIRTY_DAYS_IN_SECONDS = 30 * ONE_DAY_IN_SECONDS
 
 open_sockets = {}
 
@@ -223,6 +227,7 @@ async def register_user(user_request: PostUserRequest, db: Session = Depends(get
                 db.rollback()
                 raise HTTPException(status_code=500, detail="Inviting to band error")
         except exc.sa_exc.SQLAlchemyError:
+
             db.rollback()
             raise HTTPException(status_code=500, detail="Could not create verification code entry")
     except exc.sa_exc.SQLAlchemyError:
@@ -232,8 +237,8 @@ async def register_user(user_request: PostUserRequest, db: Session = Depends(get
     db.commit()
 
     # TODO get new app password for gmail
-    # mail = Email()
-    # mail.send_invite_email(ev.code, user_request.email)
+    mail = Email()
+    mail.send_invite_email(ev.code, user_request.email)
 
     # TODO redirect to login page or return JWT
     # from starlette.responses import RedirectResponse
@@ -255,7 +260,7 @@ async def delete_user(db: Session = Depends(get_database),
                       user: JwtUser = Depends(get_current_user)):
     try:
         db.query(BandInvite).where(BandInvite.user_id == user.user_id).delete()
-        db.query(Notification).where(Notification.recipient_user_id == user.user_id).delete()
+        db.query(DBNotification).where(DBNotification.recipient_user_id == user.user_id).delete()
         db.query(BandMember).where(BandMember.user_id == user.user_id).delete()
         db.query(LookingForBand).where(LookingForBand.user_id == user.user_id).delete()
         db.query(User).where(User.id == user.user_id).delete()
@@ -330,8 +335,14 @@ async def delete_band(band_id, db: Session = Depends(get_database),
             raise HTTPException(status_code=400, detail="Not an admin")
         band = db.query(Band).where(Band.id == band_id).first()
 
+        usr = db.query(User).where(User.id == user.user_id).first()
+        members = db.query(User).where(
+            User.id.in_(db.query(BandMember.user_id).where(BandMember.band_id == band_id))).all()
+        notify_band_members(members, band.name + " has been disbanded by " + usr.first_name + " " + usr.last_name, NotificationPriority.high, THIRTY_DAYS_IN_SECONDS)
         db.query(BandMember).where(BandMember.band_id == band_id).delete()
+        db.query(BandInvite).where(BandInvite.band_id == band_id).delete()
         db.query(LookingForMember).where(LookingForMember.band_id == band_id).delete()
+
         db.delete(band)
         db.commit()
     except exc.sa_exc.SQLAlchemyError:
@@ -362,6 +373,10 @@ async def accept_invite(code, db: Session = Depends(get_database),
         invite = db.query(BandInvite).where(BandInvite.code == code).where(
             user.user_id == BandInvite.user_id).first()
         if invite:
+            band = db.query(Band).where(Band.id == invite.band_id).first()
+            username = db.query(User.first_name, User.last_name).where(User.id == user.user_id).first()
+            notify_band_admins(db, invite.band_id, "Accepted",
+                               username.first_name + " " + username.last_name + " has joined " + band.name + "!")
             bm = BandMember(band_id=invite.band_id, user_id=user.user_id, admin=False)
             db.add(bm)
             db.delete(invite)
@@ -382,10 +397,39 @@ async def decline_invite(code, db: Session = Depends(get_database),
         if invite:
             db.delete(invite)
             db.commit()
+
+            band = db.query(Band).where(Band.id == invite.band_id).first()
+            username = db.query(User.first_name, User.last_name).where(User.id == user.user_id).first()
+            notify_band_admins(db, invite.band_id, "Declined",
+                               "{} has declined your invite to {}.".format(username.first_name + " " + username.last_name, band.name))
+
         else:
             raise HTTPException(status_code=400, detail="Invalid invite")
     except exc.sa_exc.SQLAlchemyError:
         raise HTTPException(status_code=500, detail="Could verify invite, try again later")
+
+
+def notify_band_admins(db, band_id, subject, body, priority=NotificationPriority.normal, expiry=THIRTY_DAYS_IN_SECONDS):
+    admins = db.query(User).where(User.id.in_(
+        db.query(BandMember.user_id).where(BandMember.band_id == band_id, BandMember.admin == True))).all()
+    notify_users(admins, subject, body, priority, expiry)
+
+
+def notify_band_members(db, band_id, subject, body, priority=NotificationPriority.normal,
+                        expiry=THIRTY_DAYS_IN_SECONDS):
+    members = db.query(User).where(User.id.in_(
+        db.query(BandMember.user_id).where(BandMember.band_id == band_id))).all()
+    notify_users(members, subject, body, priority, expiry)
+
+
+def notify_users(users, subject, msg, priority=NotificationPriority.normal, expiration=ONE_DAY_IN_SECONDS * 7):
+    notification = Notification()
+    email = Email()
+    for user in users:
+        if user.email_notifications_opt_in:
+            if config("ENV") is not "DEV":
+                email.send_notification_email(user.id, subject, msg)
+        notification.send(user.id, msg, time.time() + expiration, priority)
 
 
 @app.post("/send_invite")
@@ -419,11 +463,10 @@ async def user_login(gul: GetUserLogin, db: Session = Depends(get_database)):
 
 @app.put("/read_notification/{id}")
 async def read_notification(id: int, db: Session = Depends(get_database), user: JwtUser = Depends(get_current_user)):
-    notif: Notification = db.query(Notification).where(Notification.id == id).first()
+    notif: DBNotification = db.query(DBNotification).where(DBNotification.id == id,
+                                                           DBNotification.recipient_user_id == user.user_id).first()
     if notif is None:
-        raise HTTPException(status_code=404, detail="Notification does not exist")
-    if notif.recipient_user_id != user.user_id:
-        raise HTTPException(status_code=401, detail="That is not your message, but you already know this")
+        raise HTTPException(status_code=404, detail="DBNotification does not exist")
     if notif.read:
         raise HTTPException(status_code=400, detail="Message already read")
     notif.read = True
@@ -461,7 +504,7 @@ async def search(location: str, type: str, distance: int, roles, db: Session = D
             where(lat_range[0] < User.latitude, User.latitude < lat_range[1],
                   lng_range[0] < User.longitude, User.longitude < lng_range[1]).all()
     else:
-        raise HTTPException(status_code=400, detail="Bruh, that's not a type")
+        raise HTTPException(status_code=400, detail="Bruh, that's not a priority")
     return res
 
 
@@ -497,6 +540,11 @@ async def send_message(sender_user_id: int, message: Message, db: Session):
         if broken_links:
             for broken_link in broken_links:
                 user_to_user_ws_connection.remove(broken_link)
+    else:
+        notif = Notification()
+        user = db.query(User).where(User.id == sender_user_id).first()
+        notif.send(recipient_user_id, "You have a new message from " + user.first_name + " " + user.last_name,
+                   time.time() + ONE_DAY_IN_SECONDS * 7, NotificationPriority.normal)
 
     sender_ws = open_sockets.get(sender_user_id).get(recipient_user_id)
     if sender_ws:
@@ -517,8 +565,9 @@ async def send_message(sender_user_id: int, message: Message, db: Session):
 async def get_messages(target_user_id: int, db: Session = Depends(get_database),
                        user: JwtUser = Depends(get_current_user)):
     messages = db.query(DBMessage).where(or_(and_(DBMessage.recipient_user_id == user.user_id,
-                                         DBMessage.sender_user_id == target_user_id), and_(DBMessage.sender_user_id == user.user_id,
-                                         DBMessage.recipient_user_id == target_user_id)))\
+                                                  DBMessage.sender_user_id == target_user_id),
+                                             and_(DBMessage.sender_user_id == user.user_id,
+                                                  DBMessage.recipient_user_id == target_user_id))) \
         .order_by(DBMessage.sent.asc()).all()
     return messages
 
@@ -553,6 +602,7 @@ async def websocket_endpoint(websocket: WebSocket, db: Session = Depends(get_dat
         try:
             message = await websocket.receive_text()
             await send_message(user_id, Message(recipient_user_id=recipient_user_id, message=message), db)
+
         except WebSocketDisconnect:
             try:
                 user_to_recipient_sockets.remove(websocket)
